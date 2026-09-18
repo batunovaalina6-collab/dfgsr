@@ -1,0 +1,7 @@
+ваш-репозиторий/
+├── .github/
+│   └── workflows/
+│       └── bot.yml
+├── bot.py
+├── requirements.txt
+└── README.md          (необязательно)
