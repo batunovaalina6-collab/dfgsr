@@ -23,4 +23,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run bot
+        env:
+          DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
         run: python bot.py
