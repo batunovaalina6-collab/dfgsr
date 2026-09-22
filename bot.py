@@ -1,6 +1,10 @@
 import asyncio
+import os
 import time
 import uuid
+from urllib.parse import urlparse, unquote
+
+import aiomysql
 import httpx
 from telegram import Update
 from telegram.ext import (
@@ -12,16 +16,43 @@ from telegram.ext import (
 )
 
 # ============================================================
-#  КОНФИГ — впишите свои значения прямо здесь
-#  ВНИМАНИЕ: держите репозиторий ПРИВАТНЫМ!
+#  КОНФИГ — берётся из переменных окружения (GitHub Secrets)
 # ============================================================
-TELEGRAM_TOKEN    = "8947786647:AAHhruAgEoUPtqpW9BinunsQg4qMaEmGBa0"
-GIGACHAT_AUTH_KEY = "MDFhMGIzNzctZTBjNS03YjhmLWI2ZGYtMzI5MWJkZjYxOTU3OjE5N2NlMTRmLWYxYmItNDA0Ni04ODllLWNiNmVlYzE5YTI2NQ=="   # Base64 из Sber Studio
-GIGACHAT_SCOPE    = "GIGACHAT_API_PERS"
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
+GIGACHAT_SCOPE    = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
-# Как часто обновлять токен (в секундах)
-TOKEN_REFRESH_INTERVAL = 30 * 60      # обновляем каждые 30 минут
-TOKEN_STALE_AFTER      = 25 * 60      # считаем токен устаревшим через 25 минут
+# DSN вида mysql://user:pass@host:port/dbname
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+
+def parse_dsn(dsn: str) -> dict:
+    """Разбирает mysql://user:pass@host:port/dbname в параметры для aiomysql."""
+    parsed = urlparse(dsn)
+    if parsed.scheme not in ("mysql", "mysql+aiomysql"):
+        raise ValueError(f"Неподдерживаемая схема DSN: {parsed.scheme!r}")
+
+    if not parsed.hostname:
+        raise ValueError("В DSN не указан host")
+    if not parsed.path or parsed.path == "/":
+        raise ValueError("В DSN не указано имя базы данных")
+
+    return {
+        "host":     parsed.hostname,
+        "port":     parsed.port or 3306,
+        "user":     unquote(parsed.username) if parsed.username else None,
+        "password": unquote(parsed.password) if parsed.password else None,
+        "db":       parsed.path.lstrip("/"),
+        "charset":  "utf8mb4",
+        "autocommit": True,
+    }
+
+
+DB_CONFIG = parse_dsn(DATABASE_URL)
+
+# Как часто обновлять токен GigaChat
+TOKEN_REFRESH_INTERVAL = 30 * 60
+TOKEN_STALE_AFTER      = 25 * 60
 
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_API_URL   = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
@@ -37,7 +68,6 @@ _token = {
 
 
 async def refresh_token() -> str:
-    """Запрашивает новый access_token у GigaChat (Basic-авторизация)."""
     headers = {
         "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -58,7 +88,6 @@ async def refresh_token() -> str:
 
 
 async def get_token() -> str:
-    """Возвращает актуальный токен, обновляя его при необходимости."""
     async with _token_lock:
         age = time.time() - _token["issued_at"]
         if not _token["value"] or age > TOKEN_STALE_AFTER:
@@ -67,7 +96,6 @@ async def get_token() -> str:
 
 
 async def token_refresher_loop():
-    """Фоновая задача: обновляет токен каждые 30 минут."""
     try:
         async with _token_lock:
             await refresh_token()
@@ -81,6 +109,91 @@ async def token_refresher_loop():
                 await refresh_token()
         except Exception as e:
             print(f"Ошибка обновления токена: {e}")
+
+
+# ============================================================
+#  База данных
+# ============================================================
+_db_pool: aiomysql.Pool | None = None
+
+
+async def init_db_pool():
+    """Создаёт пул соединений и таблицу messages, если её нет."""
+    global _db_pool
+    _db_pool = await aiomysql.create_pool(
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        db=DB_CONFIG["db"],
+        charset=DB_CONFIG["charset"],
+        autocommit=True,
+        minsize=1,
+        maxsize=5,
+    )
+
+    async with _db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id      BIGINT       NOT NULL,
+                    username     VARCHAR(255) NULL,
+                    first_name   VARCHAR(255) NULL,
+                    last_name    VARCHAR(255) NULL,
+                    chat_id      BIGINT       NULL,
+                    chat_title   VARCHAR(255) NULL,
+                    message_text MEDIUMTEXT   NULL,
+                    created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user (user_id),
+                    INDEX idx_created (created_at)
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+            """)
+    print(f"Пул БД готов: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['db']}")
+
+
+async def close_db_pool():
+    global _db_pool
+    if _db_pool:
+        _db_pool.close()
+        await _db_pool.wait_closed()
+        print("Пул БД закрыт")
+
+
+async def save_message(
+    user_id: int,
+    username: str | None,
+    first_name: str | None,
+    last_name: str | None,
+    chat_id: int,
+    chat_title: str | None,
+    message_text: str | None,
+):
+    if _db_pool is None:
+        print("Пул БД не инициализирован, пропускаю запись")
+        return
+    try:
+        async with _db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO messages
+                        (user_id, username, first_name, last_name,
+                         chat_id, chat_title, message_text)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user_id,
+                        username,
+                        first_name,
+                        last_name,
+                        chat_id,
+                        chat_title,
+                        message_text,
+                    ),
+                )
+    except Exception as e:
+        print(f"Ошибка записи в БД: {e}")
 
 
 # ============================================================
@@ -104,7 +217,6 @@ async def ask_gigachat(prompt: str) -> str:
     token = await get_token()
     resp = await _do_request(token)
 
-    # если токен внезапно протух — принудительно обновляем и повторяем один раз
     if resp.status_code == 401:
         async with _token_lock:
             await refresh_token()
@@ -123,21 +235,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.chat.send_action("typing")
+    msg = update.message
+    user = msg.from_user
+
+    asyncio.create_task(
+        save_message(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            chat_id=msg.chat_id,
+            chat_title=msg.chat.title,
+            message_text=msg.text,
+        )
+    )
+
+    await msg.chat.send_action("typing")
     try:
-        answer = await ask_gigachat(update.message.text)
-        await update.message.reply_text(answer)
+        answer = await ask_gigachat(msg.text)
+        await msg.reply_text(answer)
     except httpx.HTTPStatusError as e:
-        await update.message.reply_text(
+        await msg.reply_text(
             f"GigaChat {e.response.status_code}:\n{e.response.text[:300]}"
         )
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        await msg.reply_text(f"Ошибка: {e}")
 
 
+# ============================================================
+#  Startup / Shutdown
+# ============================================================
 async def on_startup(app):
     app.bot_data["token_task"] = asyncio.create_task(token_refresher_loop())
     print("Фоновая задача обновления токена запущена")
+
+    try:
+        await init_db_pool()
+    except Exception as e:
+        print(f"Не удалось подключиться к БД: {e}")
 
 
 async def on_shutdown(app):
@@ -148,6 +283,8 @@ async def on_shutdown(app):
             await task
         except asyncio.CancelledError:
             pass
+
+    await close_db_pool()
 
 
 def main():
